@@ -1,3 +1,3 @@
-# practice5-devops
+# soda_guide
 
-Claude Skillsによる自動同柟ワークフローのテストに使用します。最新のマスターではありません。
+SODA初心者向けガイド
