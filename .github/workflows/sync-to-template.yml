@@ -1,0 +1,354 @@
+# 統合版同期ワークフロー
+# このファイルは Claude Code の deploy-sync-workflow コマンドによって
+# 各同期元リポジトリの .github/workflows/ に配置されます
+
+name: Sync to Template Repository
+
+on:
+  push:
+    branches:
+      - feature/Requirements-definition  # Claude Code が実際のブランチ名に置換
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '強制同期（変更がなくてもPR作成）'
+        required: false
+        default: 'false'
+        type: boolean
+
+# 同時実行制御（重複する同期処理を防ぐ）
+concurrency:
+  group: sync-to-template-${{ github.ref }}
+  cancel-in-progress: false
+
+# デフォルト環境変数（.sync-config.yml で上書き可能）
+env:
+  TEMPLATE_REPO: IoVPF-AgenticSoftwareEngineering/agents-startup
+  TARGET_BRANCH: feature/agents-startup_0.2.1
+  SOURCE_BRANCH: feature/Requirements-definition  # Claude Code が実際のブランチ名に置換
+  TARGET_DIR: soda_guide        # Claude Code が実際のディレクトリ名に置換
+  SYNC_BRANCH: sync/soda_guide-update
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      # =====================================================
+      # 1. ソースリポジトリのチェックアウト
+      # =====================================================
+      - name: Checkout source repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # =====================================================
+      # 2. 同期設定の読み込み
+      # =====================================================
+      - name: Load sync configuration
+        id: config
+        run: |
+          echo "=== 同期設定読み込み ==="
+
+          # 設定ファイルの確認
+          if [ -f ".sync-config.yml" ]; then
+            echo "✅ 設定ファイル (.sync-config.yml) が見つかりました"
+            cat .sync-config.yml
+            echo ""
+
+            # YAML設定から値を抽出（シンプルなgrep/sedを使用）
+            extract_yaml_value() {
+              local key="$1"
+              local file="$2"
+              grep "^[[:space:]]*${key}:" "$file" | sed "s/^[[:space:]]*${key}:[[:space:]]*//" | sed 's/^"//' | sed 's/"$//'
+            }
+
+            TEMPLATE_REPO=$(extract_yaml_value "template_repo" .sync-config.yml)
+            TARGET_BRANCH=$(extract_yaml_value "target_branch" .sync-config.yml)
+            SOURCE_BRANCH=$(extract_yaml_value "source_branch" .sync-config.yml)
+            TARGET_DIR=$(extract_yaml_value "target_dir" .sync-config.yml)
+
+            # デフォルト値の設定
+            echo "template_repo=${TEMPLATE_REPO:-IoVPF-AgenticSoftwareEngineering/agents-startup}" >> $GITHUB_OUTPUT
+            echo "target_branch=${TARGET_BRANCH:-feature/agents-startup_0.2.1}" >> $GITHUB_OUTPUT
+            echo "source_branch=${SOURCE_BRANCH:-main}" >> $GITHUB_OUTPUT
+            echo "target_dir=${TARGET_DIR:-repo-files}" >> $GITHUB_OUTPUT
+
+            echo "📋 読み込んだ設定:"
+            echo "  - テンプレートリポジトリ: ${TEMPLATE_REPO:-IoVPF-AgenticSoftwareEngineering/agents-startup}"
+            echo "  - 同期先ブランチ: ${TARGET_BRANCH:-feature/agents-startup_0.2.1}"
+            echo "  - 同期元ブランチ: ${SOURCE_BRANCH:-main}"
+            echo "  - 同期先ディレクトリ: ${TARGET_DIR:-repo-files}"
+          else
+            echo "⚠️  設定ファイル (.sync-config.yml) が見つかりません"
+            echo "🔧 デフォルト値を使用します"
+            echo "template_repo=IoVPF-AgenticSoftwareEngineering/agents-startup" >> $GITHUB_OUTPUT
+            echo "target_branch=feature/agents-startup_0.2.1" >> $GITHUB_OUTPUT
+            echo "source_branch=main" >> $GITHUB_OUTPUT
+            echo "target_dir=repo-files" >> $GITHUB_OUTPUT
+          fi
+
+      # =====================================================
+      # 3. 同期内容の準備
+      # =====================================================
+      - name: Prepare sync content
+        id: prepare
+        run: |
+          echo "=== 同期内容準備 ==="
+          echo "📂 同期元ブランチ: ${{ steps.config.outputs.source_branch }}"
+          echo "📂 同期先リポジトリ: ${{ steps.config.outputs.template_repo }}"
+          echo "📂 同期先ブランチ: ${{ steps.config.outputs.target_branch }}"
+          echo "📂 同期先ディレクトリ: ${{ steps.config.outputs.target_dir }}"
+          echo ""
+
+          # 作業ディレクトリの準備
+          mkdir -p sync-content
+          mkdir -p sync-logs
+
+          # 同期対象の決定
+          if [ -f ".sync-config.yml" ]; then
+            echo "📋 設定ファイルから同期対象を取得"
+
+            # targets配列から同期対象パスを抽出
+            awk '/targets:/,/^[^[:space:]]/ {
+              if (/- path:/) {
+                gsub(/^[[:space:]]*- path:[[:space:]]*"?/, "")
+                gsub(/"?[[:space:]]*$/, "")
+                if (length($0) > 0) print $0
+              }
+            }' .sync-config.yml > sync-paths.txt
+
+            echo "🎯 同期対象パス:"
+            cat sync-paths.txt | sed 's/^/  - /'
+            echo ""
+
+            # 各パスに対して同期処理
+            sync_all=false
+            while IFS= read -r sync_path || [ -n "$sync_path" ]; do
+              [ -z "$sync_path" ] && continue
+
+              if [ "$sync_path" = "." ]; then
+                echo "📦 リポジトリ全体を同期"
+                sync_all=true
+                rsync -av \
+                  --exclude='.git' \
+                  --exclude='sync-content' \
+                  --exclude='sync-paths.txt' \
+                  --exclude='sync-logs' \
+                  ./ sync-content/ 2>&1 | tee sync-logs/rsync-all.log
+                break
+              else
+                echo "📁 パス '$sync_path' を同期"
+                if [ -d "$sync_path" ]; then
+                  echo "  ディレクトリとして処理"
+                  rsync -av "$sync_path"/ sync-content/ 2>&1 | tee "sync-logs/rsync-${sync_path//\//_}.log"
+                elif [ -f "$sync_path" ]; then
+                  echo "  ファイルとして処理"
+                  mkdir -p "sync-content/$(dirname "$sync_path")"
+                  cp "$sync_path" sync-content/
+                else
+                  echo "  ⚠️  パス '$sync_path' が見つかりません"
+                fi
+              fi
+            done < sync-paths.txt
+
+            # 個別ファイル/ディレクトリ同期の場合の後処理
+            if [ "$sync_all" = false ] && [ -s sync-paths.txt ]; then
+              echo "📝 個別同期完了"
+            fi
+
+          else
+            echo "📦 設定ファイルがないため、リポジトリ全体を同期"
+            rsync -av \
+              --exclude='.git' \
+              --exclude='sync-content' \
+              ./ sync-content/ 2>&1 | tee sync-logs/rsync-default.log
+          fi
+
+          # 同期内容の確認
+          echo ""
+          echo "📊 同期内容のサマリー:"
+          if [ -d sync-content ] && [ "$(ls -A sync-content 2>/dev/null)" ]; then
+            file_count=$(find sync-content -type f | wc -l)
+            dir_count=$(find sync-content -type d | wc -l)
+            total_size=$(du -sh sync-content | cut -f1)
+
+            echo "  - ファイル数: $file_count"
+            echo "  - ディレクトリ数: $dir_count"
+            echo "  - 総サイズ: $total_size"
+            echo ""
+            echo "🗂️  主要ファイル (先頭20件):"
+            find sync-content -type f | sort | head -20 | sed 's/^sync-content\//  - /'
+
+            echo "has_content=true" >> $GITHUB_OUTPUT
+          else
+            echo "  ⚠️  同期対象が見つかりませんでした"
+            echo "has_content=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      # =====================================================
+      # 4. テンプレートリポジトリへの同期
+      # =====================================================
+      - name: Sync to template repository
+        if: steps.prepare.outputs.has_content == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          echo "=== テンプレートリポジトリへの同期実行 ==="
+
+          # GitHub CLIの設定確認
+          if ! command -v gh &> /dev/null; then
+            echo "❌ GitHub CLI (gh) が見つかりません"
+            exit 1
+          fi
+
+          # トークンの確認
+          if [ -z "${{ secrets.SYNC_TOKEN }}" ]; then
+            echo "❌ SYNC_TOKEN シークレットが設定されていません"
+            echo "   リポジトリ設定 → Secrets and variables → Actions → New repository secret"
+            echo "   Name: SYNC_TOKEN"
+            echo "   Value: <テンプレートリポジトリへの書き込み権限を持つPAT>"
+            exit 1
+          fi
+
+          # テンプレートリポジトリをクローン
+          echo "📥 テンプレートリポジトリをクローン"
+          git clone --depth=1 --branch ${{ steps.config.outputs.target_branch }} \
+            "https://x-access-token:${{ secrets.SYNC_TOKEN }}@github.com/${{ steps.config.outputs.template_repo }}.git" \
+            template-repo
+
+          cd template-repo
+
+          # 同期ブランチを作成（タイムスタンプ付き）
+          SYNC_BRANCH="sync/${{ steps.config.outputs.target_dir }}-$(date +%Y%m%d-%H%M%S)"
+          echo "🌿 同期ブランチを作成: $SYNC_BRANCH"
+          git checkout -b "$SYNC_BRANCH"
+
+          # 既存ディレクトリの処理
+          if [ -d "${{ steps.config.outputs.target_dir }}" ]; then
+            echo "🗑️  既存ディレクトリを削除: ${{ steps.config.outputs.target_dir }}"
+            rm -rf "${{ steps.config.outputs.target_dir }}"
+          fi
+
+          # 新しい内容をコピー
+          echo "📂 新しい内容をコピー"
+          mkdir -p "${{ steps.config.outputs.target_dir }}"
+          if [ "$(ls -A ../sync-content 2>/dev/null)" ]; then
+            cp -r ../sync-content/* "${{ steps.config.outputs.target_dir }}/"
+            echo "✅ コピー完了"
+          else
+            echo "❌ 同期内容が空です"
+            exit 1
+          fi
+
+          # 変更の確認
+          echo ""
+          echo "🔍 変更を確認"
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "ℹ️  変更なし - 同期をスキップ"
+            if [ "${{ github.event.inputs.force }}" = "true" ]; then
+              echo "🔄 強制同期モードのため、空コミットを作成"
+              git commit --allow-empty -m "Force sync: No changes detected
+
+Forced sync from: $GITHUB_REPOSITORY (${{ steps.config.outputs.source_branch }})
+Sync to: ${{ steps.config.outputs.target_dir }}/
+Commit: $GITHUB_SHA
+Timestamp: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+            else
+              echo "終了します"
+              exit 0
+            fi
+          else
+            echo "📊 変更サマリー:"
+            git diff --cached --stat
+            echo ""
+          fi
+
+          # Git設定
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+          # コミット作成
+          if git diff --cached --quiet && [ "${{ github.event.inputs.force }}" != "true" ]; then
+            # 変更なしで強制モードでない場合はスキップ
+            :
+          else
+            echo "💾 コミットを作成"
+            REPO_NAME=$(echo $GITHUB_REPOSITORY | cut -d'/' -f2)
+            git commit -m "Auto-sync: Update ${{ steps.config.outputs.target_dir }} from $REPO_NAME
+
+📋 Sync Details:
+- Source: $GITHUB_REPOSITORY (${{ steps.config.outputs.source_branch }})
+- Target: ${{ steps.config.outputs.target_dir }}/
+- Commit: $GITHUB_SHA
+- Timestamp: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+
+🔄 Sync Trigger: ${{ github.event_name }}$([ "${{ github.event.inputs.force }}" = "true" ] && echo " (forced)" || echo "")"
+
+            # プッシュ
+            echo "📤 ブランチをプッシュ"
+            git push origin "$SYNC_BRANCH"
+
+            # Pull Request作成
+            echo "📝 Pull Requestを作成"
+            REPO_NAME=$(echo $GITHUB_REPOSITORY | cut -d'/' -f2)
+
+            gh pr create \
+              --title "🔄 [Auto-sync] Update ${{ steps.config.outputs.target_dir }} from $REPO_NAME" \
+              --body "## 📋 概要
+自動同期により、${{ steps.config.outputs.target_dir }} ディレクトリを最新化しました。
+
+## 📊 同期詳細
+| 項目 | 値 |
+|------|-----|
+| **同期元リポジトリ** | \`$GITHUB_REPOSITORY\` |
+| **同期元ブランチ** | \`${{ steps.config.outputs.source_branch }}\` |
+| **同期先ディレクトリ** | \`${{ steps.config.outputs.target_dir }}/\` |
+| **同期元コミット** | \`$GITHUB_SHA\` |
+| **同期実行時刻** | \`$(date -u +"%Y-%m-%d %H:%M:%S UTC")\` |
+| **トリガー** | \`${{ github.event_name }}\`$([ "${{ github.event.inputs.force }}" = "true" ] && echo " (強制実行)" || echo "") |
+
+## 🔍 確認事項
+- [ ] 変更内容を確認
+- [ ] 必要に応じて動作確認を実施
+- [ ] 問題がなければマージ
+
+## 🤖 自動生成
+このPRは GitHub Actions により自動生成されました。
+- ワークフロー: [\`Sync to Template Repository\`]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)
+- 同期設定: [\`.sync-config.yml\`]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/blob/${{ steps.config.outputs.source_branch }}/.sync-config.yml)" \
+              --base ${{ steps.config.outputs.target_branch }} \
+              --head "$SYNC_BRANCH" \
+              --label automated,sync,${{ steps.config.outputs.target_dir }} \
+              --reviewer "" \
+              --assignee ""
+
+            echo "✅ Pull Request作成完了"
+            echo "🔗 PR URL: $(gh pr view --json url --jq .url)"
+          fi
+
+      # =====================================================
+      # 5. 結果サマリー
+      # =====================================================
+      - name: Summary
+        if: always()
+        run: |
+          echo "=== 同期結果サマリー ==="
+          echo "📊 実行結果:"
+          echo "  - ワークフロー実行ID: $GITHUB_RUN_ID"
+          echo "  - 同期元: $GITHUB_REPOSITORY (${{ steps.config.outputs.source_branch }})"
+          echo "  - 同期先: ${{ steps.config.outputs.template_repo }} (${{ steps.config.outputs.target_branch }})"
+          echo "  - ターゲット: ${{ steps.config.outputs.target_dir }}/"
+          echo ""
+          echo "🔗 詳細ログ:"
+          echo "  - Actions: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+          if [ -d sync-logs ]; then
+            echo ""
+            echo "📋 同期ログファイル:"
+            find sync-logs -name "*.log" -exec echo "  - {}" \;

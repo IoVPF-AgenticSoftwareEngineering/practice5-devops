@@ -1,0 +1,19 @@
+# 同期設定ファイル
+# このファイルは Claude Code の bulk-deploy-sync-workflows コマンドによって生成されました
+
+sync:
+  # テンプレートリポジトリ（同期先）
+  template_repo: "IoVPF-AgenticSoftwareEngineering/agents-startup"
+
+  # 同期先ブランチ
+  target_branch: "feature/agents-startup_0.2.1"
+
+  # 同期元ブランチ（このリポジトリ）
+  source_branch: "feature/Requirements-definition"
+
+  # 同期先ディレクトリ（テンプレートリポジトリ内）
+  target_dir: "soda_guide"
+
+  # 同期対象（このリポジトリ内のパス）
+  targets:
+    - path: "Soda_Beginner_Guide.md"
